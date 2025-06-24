@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Tuple
 from kademlia.network import Server
 import aiofiles
 from dataclasses import dataclass
-import struct
 import logging
 
 # Configuración de logging
@@ -46,7 +45,6 @@ class FragmentManager:
                 end = min(start + self.fragment_size, file_size)
                 fragment_data = file_data[start:end]
                 
-                # Calcular hash del fragmento
                 fragment_hash = hashlib.sha256(fragment_data).hexdigest()
                 
                 fragment = Fragment(
@@ -69,10 +67,8 @@ class FragmentManager:
         if not fragments:
             return False
         
-        # Ordenar fragmentos por índice
         fragments.sort(key=lambda x: x.index)
         
-        # Verificar que tenemos todos los fragmentos
         expected_fragments = fragments[0].total_fragments
         if len(fragments) != expected_fragments:
             logger.error(f"Faltan fragmentos: {len(fragments)}/{expected_fragments}")
@@ -107,8 +103,9 @@ class P2PNode:
         self.fragment_manager = FragmentManager()
         self.active_downloads: Dict[str, Dict] = {}
         self.stored_fragments: Dict[str, Fragment] = {}
-        self.file_registry: Dict[str, List[str]] = {}  # filename -> [fragment_hashes]
+        self.file_registry: Dict[str, List[str]] = {}
         self.running = False
+        self.tcp_server = None
     
     async def start(self, bootstrap_nodes: List[Tuple[str, int]] = None):
         """Inicia el nodo P2P"""
@@ -119,6 +116,11 @@ class P2PNode:
             if bootstrap_nodes:
                 await self.server.bootstrap(bootstrap_nodes)
                 logger.info(f"Conectado a nodos bootstrap: {bootstrap_nodes}")
+            
+            self.tcp_server = await asyncio.start_server(
+                self.handle_fragment_request, '127.0.0.1', self.port + 1000
+            )
+            logger.info(f"Servidor TCP iniciado en puerto {self.port + 1000}")
             
             self.running = True
             logger.info(f"Nodo {self.node_id} iniciado exitosamente")
@@ -131,25 +133,47 @@ class P2PNode:
         """Detiene el nodo P2P"""
         self.running = False
         self.server.stop()
+        if self.tcp_server:
+            self.tcp_server.close()
+            await self.tcp_server.wait_closed()
         logger.info(f"Nodo {self.node_id} detenido")
+    
+    async def handle_fragment_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Maneja solicitudes de fragmentos de otros nodos"""
+        try:
+            data = await reader.read(1024)
+            fragment_hash = data.decode().strip()
+            
+            if fragment_hash in self.stored_fragments:
+                fragment = self.stored_fragments[fragment_hash]
+                writer.write(fragment.data)
+                await writer.drain()
+                logger.info(f"Fragmento {fragment_hash[:8]} enviado a peer")
+            else:
+                writer.write(b"")
+                await writer.drain()
+                logger.warning(f"Fragmento {fragment_hash[:8]} no encontrado")
+                
+        except Exception as e:
+            logger.error(f"Error manejando solicitud de fragmento: {e}")
+        finally:
+            writer.close()
+            await writer.wait_closed()
     
     async def store_file(self, filepath: str) -> bool:
         """Almacena un archivo fragmentándolo en la red"""
         try:
-            # Fragmentar archivo
             fragments = self.fragment_manager.fragment_file(filepath)
             filename = os.path.basename(filepath)
             
-            # Almacenar fragmentos localmente
             fragment_hashes = []
             for fragment in fragments:
                 self.stored_fragments[fragment.hash] = fragment
                 fragment_hashes.append(fragment.hash)
                 
-                # Registrar fragmento en DHT
                 fragment_info = {
                     'node_id': self.node_id,
-                    'node_address': ('127.0.0.1', self.port),
+                    'node_address': ('127.0.0.1', self.port + 1000),
                     'filename': filename,
                     'index': fragment.index,
                     'total_fragments': fragment.total_fragments,
@@ -159,7 +183,6 @@ class P2PNode:
                 await self.server.set(fragment.hash, json.dumps(fragment_info))
                 logger.info(f"Fragmento {fragment.index} registrado: {fragment.hash[:8]}...")
             
-            # Registrar archivo completo
             self.file_registry[filename] = fragment_hashes
             file_info = {
                 'filename': filename,
@@ -195,26 +218,44 @@ class P2PNode:
     async def download_fragment(self, fragment_hash: str, peer_address: Tuple[str, int]) -> Optional[Fragment]:
         """Descarga un fragmento específico de un peer"""
         try:
-            # En una implementación real, esto sería una conexión directa TCP/UDP
-            # Por simplicidad, simulamos que obtenemos el fragmento del nodo local
-            if fragment_hash in self.stored_fragments:
-                fragment = self.stored_fragments[fragment_hash]
-                logger.info(f"Fragmento descargado localmente: {fragment_hash[:8]}...")
+            # Obtener metadatos del fragmento desde la DHT
+            fragment_info_str = await self.server.get(fragment_hash)
+            if not fragment_info_str:
+                logger.warning(f"Metadatos no encontrados para fragmento: {fragment_hash[:8]}")
+                return None
+            fragment_info = json.loads(fragment_info_str)
+            
+            reader, writer = await asyncio.open_connection(peer_address[0], peer_address[1])
+            writer.write(fragment_hash.encode())
+            await writer.drain()
+            
+            data = await reader.read()
+            if data:
+                fragment = Fragment(
+                    hash=fragment_hash,
+                    size=len(data),
+                    index=fragment_info['index'],
+                    total_fragments=fragment_info['total_fragments'],
+                    filename=fragment_info['filename'],
+                    data=data
+                )
+                logger.info(f"Fragmento descargado: {fragment_hash[:8]} desde {peer_address}")
                 return fragment
             else:
-                # Simular descarga desde peer remoto
-                await asyncio.sleep(0.1)  # Simular latencia de red
-                logger.warning(f"Fragmento no disponible: {fragment_hash[:8]}...")
+                logger.warning(f"Fragmento no disponible: {fragment_hash[:8]} en {peer_address}")
                 return None
                 
         except Exception as e:
             logger.error(f"Error descargando fragmento {fragment_hash}: {e}")
             return None
+        finally:
+            if 'writer' in locals():
+                writer.close()
+                await writer.wait_closed()
     
     async def download_file(self, filename: str, output_path: str) -> bool:
         """Descarga un archivo completo de la red P2P"""
         try:
-            # Buscar información del archivo
             file_info = await self.search_file(filename)
             if not file_info:
                 logger.error(f"Archivo no encontrado: {filename}")
@@ -225,7 +266,6 @@ class P2PNode:
             
             logger.info(f"Iniciando descarga de {filename} ({total_fragments} fragmentos)")
             
-            # Obtener información de cada fragmento
             download_tasks = []
             fragment_peers = {}
             
@@ -235,31 +275,26 @@ class P2PNode:
                     fragment_info = json.loads(fragment_info_str)
                     peer_address = tuple(fragment_info['node_address'])
                     fragment_peers[fragment_hash] = peer_address
-                    
-                    # Crear tarea de descarga
                     task = self.download_fragment(fragment_hash, peer_address)
                     download_tasks.append(task)
                 else:
                     logger.error(f"No se pudo obtener info del fragmento: {fragment_hash[:8]}...")
                     return False
             
-            # Ejecutar descargas en paralelo
             start_time = time.time()
             fragments = await asyncio.gather(*download_tasks, return_exceptions=True)
             download_time = time.time() - start_time
             
-            # Filtrar fragmentos válidos
             valid_fragments = [f for f in fragments if isinstance(f, Fragment)]
             
             if len(valid_fragments) != total_fragments:
                 logger.error(f"Descarga incompleta: {len(valid_fragments)}/{total_fragments}")
                 return False
             
-            # Ensamblar archivo
             success = self.fragment_manager.assemble_file(valid_fragments, output_path)
             if success:
                 total_size = sum(f.size for f in valid_fragments)
-                speed = total_size / download_time / 1024 / 1024  # MB/s
+                speed = total_size / download_time / 1024 / 1024
                 logger.info(f"Descarga completada: {filename}")
                 logger.info(f"Tiempo: {download_time:.2f}s, Velocidad: {speed:.2f} MB/s")
             
@@ -276,8 +311,6 @@ class P2PNode:
     async def get_network_stats(self) -> Dict:
         """Obtiene estadísticas de la red"""
         try:
-            # En Kademlia, no hay una forma directa de contar nodos
-            # Esto es una aproximación
             routing_table_size = len(self.server.protocol.router.buckets)
             
             stats = {
@@ -326,32 +359,26 @@ class P2PNetwork:
         self.nodes.clear()
         logger.info("Red P2P apagada")
 
-# Ejemplo de uso y pruebas
 async def demo_p2p_system():
     """Demostración del sistema P2P"""
     print("=== Demo Sistema P2P ===")
     
-    # Crear red P2P
     network = P2PNetwork()
     
     try:
-        # Crear nodo bootstrap
         await network.create_bootstrap_node()
         await asyncio.sleep(1)
         
-        # Agregar nodos adicionales
         node1 = await network.add_node("node1", 8469)
         node2 = await network.add_node("node2", 8470)
         await asyncio.sleep(2)
         
-        # Crear archivo de prueba
         test_file = "test_file.txt"
         with open(test_file, 'w') as f:
             f.write("Este es un archivo de prueba para el sistema P2P.\n" * 100)
         
         print(f"Archivo de prueba creado: {test_file}")
         
-        # Almacenar archivo en node1
         print("Almacenando archivo en node1...")
         success = await node1.store_file(test_file)
         if success:
@@ -362,7 +389,6 @@ async def demo_p2p_system():
         
         await asyncio.sleep(2)
         
-        # Buscar archivo desde node2
         print("Buscando archivo desde node2...")
         file_info = await node2.search_file(os.path.basename(test_file))
         if file_info:
@@ -373,14 +399,12 @@ async def demo_p2p_system():
             print("✗ Archivo no encontrado")
             return
         
-        # Descargar archivo en node2
         print("Descargando archivo en node2...")
         output_file = "downloaded_" + test_file
         success = await node2.download_file(os.path.basename(test_file), output_file)
         if success:
             print(f"✓ Archivo descargado como: {output_file}")
             
-            # Verificar integridad
             with open(test_file, 'rb') as f1, open(output_file, 'rb') as f2:
                 if f1.read() == f2.read():
                     print("✓ Integridad verificada: archivos idénticos")
@@ -389,7 +413,6 @@ async def demo_p2p_system():
         else:
             print("✗ Error descargando archivo")
         
-        # Mostrar estadísticas
         print("\n=== Estadísticas de Red ===")
         for node_id, node in network.nodes.items():
             stats = await node.get_network_stats()
@@ -401,10 +424,8 @@ async def demo_p2p_system():
         await asyncio.sleep(1)
         
     finally:
-        # Limpiar
         await network.shutdown_network()
         
-        # Eliminar archivos de prueba
         for file in [test_file, "downloaded_" + test_file]:
             if os.path.exists(file):
                 os.remove(file)
@@ -412,5 +433,4 @@ async def demo_p2p_system():
         print("\n=== Demo completada ===")
 
 if __name__ == "__main__":
-    # Ejecutar demo
     asyncio.run(demo_p2p_system())
